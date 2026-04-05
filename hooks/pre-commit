@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+echo "==> mix format --check-formatted"
+mix format --check-formatted
+
+echo "==> mix compile --warnings-as-errors"
+mix compile --warnings-as-errors
+
+echo "==> mix credo --strict"
+mix credo --strict
+
+echo "==> mix test"
+mix test
+
+echo "==> mix dialyzer"
+mix dialyzer --format short
+
+echo "All checks passed."
