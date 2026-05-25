@@ -4,8 +4,8 @@ defmodule Locker.Store.CubDB do
 
   ## Options
 
-  - `:path` — directory for CubDB data files (required)
-  - `:auto_compact` — enable auto compaction (default: true)
+  * `:path`: directory for CubDB data files (required)
+  * `:auto_compact`: enable auto compaction (default: true)
   """
 
   @behaviour Locker.Store

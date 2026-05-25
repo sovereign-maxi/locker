@@ -36,10 +36,10 @@ defmodule Locker.WAL do
 
   ## Security
 
-  WAL segments are **not encrypted at rest**. Segment files are created
-  with `0600` permissions (owner-only). If the WAL contains sensitive
-  data (key material, credentials), the caller must encrypt payloads
-  before passing them to `append/2`.
+  WAL segments are not encrypted at rest. Segment files are created
+  with `0600` permissions (owner-only). Callers writing sensitive
+  payloads (key material, credentials) must encrypt before passing
+  to `append/2`.
   """
 
   use GenServer
@@ -76,8 +76,8 @@ defmodule Locker.WAL do
   Returns all valid entries from all WAL segments.
 
   Accepts an optional timeout (default 30s). Large WALs with millions
-  of entries may need a longer timeout — or use `replay/3` directly
-  for recovery scenarios.
+  of entries may need a longer timeout; for recovery scenarios use
+  `replay/3` directly instead of going through the GenServer.
   """
   @spec read_all(GenServer.server(), timeout()) :: {:ok, [Entry.t()]} | {:error, term()}
   def read_all(server \\ __MODULE__, timeout \\ 30_000) do
@@ -110,12 +110,13 @@ defmodule Locker.WAL do
 
   ## Options
 
-  - `:skip_corrupt` — skip corrupt segments with a warning (default: false)
+  * `:skip_corrupt`: skip corrupt segments with a warning (default: false)
 
   ## Returns
 
-  - `{:ok, entries, corrupt_count}` on success
-  - `{:error, {:corrupt_segment, path, reason}}` if corrupt and skip_corrupt is false
+  * `{:ok, entries, corrupt_count}` on success
+  * `{:error, {:corrupt_segment, path, reason}}` if corrupt and
+    `skip_corrupt` is false
   """
   @spec replay(binary(), %{non_neg_integer() => atom()}, keyword()) ::
           {:ok, [Entry.t()], non_neg_integer()}
@@ -362,7 +363,7 @@ defmodule Locker.WAL do
         )
 
         if failures >= @max_rotation_retries do
-          Logger.error("WAL: #{failures} consecutive rotation failures — halting writes")
+          Logger.error("WAL: #{failures} consecutive rotation failures, halting writes")
           Map.merge(state, %{rotation_failures: failures, writes_halted: true})
         else
           Map.put(state, :rotation_failures, failures)
@@ -418,7 +419,7 @@ defmodule Locker.WAL do
 
             if pos > @header_size and header_count == 0 do
               Logger.warning(
-                "WAL: segment #{path} has entries but header count is 0 — header may be stale"
+                "WAL: segment #{path} has entries but header count is 0; header may be stale"
               )
             end
 
@@ -531,7 +532,7 @@ defmodule Locker.WAL do
 
     if length(bytes) != length(Enum.uniq(bytes)) do
       raise ArgumentError,
-            "WAL type_map has duplicate byte values — each type must map to a unique byte"
+            "WAL type_map has duplicate byte values; each type must map to a unique byte"
     end
 
     unless Map.has_key?(type_map, :checkpoint) do

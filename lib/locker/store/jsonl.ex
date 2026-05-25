@@ -10,7 +10,7 @@ defmodule Locker.Store.JSONL do
 
   ## Options
 
-  - `:path` — file path for the JSONL file (required)
+  * `:path`: file path for the JSONL file (required)
   """
 
   @behaviour Locker.Store
@@ -103,7 +103,7 @@ defmodule Locker.Store.JSONL do
     case File.stat(path) do
       {:ok, %{size: size}} when size > @max_file_bytes ->
         raise RuntimeError,
-              "JSONL file #{path} exceeds #{@max_file_bytes} bytes — " <>
+              "JSONL file #{path} exceeds #{@max_file_bytes} bytes; " <>
                 "call delete to compact or switch to CubDB for large datasets"
 
       _stat ->

@@ -8,8 +8,8 @@ defmodule Locker.Store.DETS do
 
   ## Options
 
-  - `:name` — DETS table name (required)
-  - `:path` — file path for the DETS file (required)
+  * `:name`: DETS table name (required)
+  * `:path`: file path for the DETS file (required)
   """
 
   @behaviour Locker.Store

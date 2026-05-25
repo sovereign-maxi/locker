@@ -4,10 +4,10 @@ defmodule Locker.Store do
 
   Implementations provide persistence with varying tradeoffs:
 
-  - `Locker.Store.ETS` — in-memory, fastest, no persistence
-  - `Locker.Store.DETS` — file-backed, 2GB limit, good for small datasets
-  - `Locker.Store.CubDB` — pure Elixir B-tree, ACID, no size limit
-  - `Locker.Store.JSONL` — append-only log, human-readable, good for audit trails
+  * `Locker.Store.ETS`: in-memory, fastest, no persistence
+  * `Locker.Store.DETS`: file-backed, 2 GB limit, good for small datasets
+  * `Locker.Store.CubDB`: pure Elixir B-tree, ACID, no size limit
+  * `Locker.Store.JSONL`: append-only log, human-readable, good for audit trails
   """
 
   @type ref :: term()

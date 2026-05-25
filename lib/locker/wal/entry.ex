@@ -12,8 +12,9 @@ defmodule Locker.WAL.Entry do
       | payload | variable | Erlang term_to_binary encoded data   |
 
   CRC32 is computed over `type <> payload` (excludes length and CRC fields).
-  CRC32 detects accidental corruption only — it is not cryptographic.
-  If tamper-detection is required, encrypt or HMAC payloads before encoding.
+  CRC32 catches accidental corruption (bitrot, torn writes); it does
+  not provide tamper-detection. Callers requiring authenticity should
+  encrypt or HMAC payloads before encoding.
 
   ## Type Registry
 

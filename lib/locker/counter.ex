@@ -1,9 +1,13 @@
 defmodule Locker.Counter do
   @moduledoc """
-  Atomic counter with ETS for fast reads and DETS for durability.
+  GenServer-backed atomic counter.
 
-  Provides lock-free increments via `:ets.update_counter/4` with periodic
-  DETS sync. Survives restarts by restoring from DETS on init.
+  Increments use `:dets.update_counter/3` for atomic-and-durable
+  updates, then mirror the result into a `:protected` ETS table for
+  cheap reads. All public functions go through the GenServer, so
+  callers see serialized semantics regardless of concurrency.
+
+  Survives restarts by restoring counter values from DETS on init.
 
   ## Usage
 
@@ -16,7 +20,8 @@ defmodule Locker.Counter do
 
       Locker.Counter.increment(MyApp.LiabilityCounter, :total_minted, 1000)
       Locker.Counter.read(MyApp.LiabilityCounter, :total_minted)  # 1000
-      Locker.Counter.read_all(MyApp.LiabilityCounter)  # %{total_minted: 1000, total_burned: 0}
+      Locker.Counter.read_all(MyApp.LiabilityCounter)
+      # %{total_minted: 1000, total_burned: 0}
   """
 
   use GenServer

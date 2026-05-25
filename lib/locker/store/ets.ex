@@ -4,8 +4,8 @@ defmodule Locker.Store.ETS do
 
   ## Options
 
-  - `:name` — ETS table name (required)
-  - `:access` — `:public`, `:protected`, or `:private` (default: `:public`)
+  * `:name`: ETS table name (required)
+  * `:access`: `:public`, `:protected`, or `:private` (default: `:public`)
   """
 
   @behaviour Locker.Store

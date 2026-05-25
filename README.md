@@ -139,16 +139,16 @@ Counter.restore(MyApp.LiabilityCounter, :total_minted, 5000) # Set specific valu
 Pluggable key-value storage. All backends implement `Locker.Store`:
 
 ```elixir
-# ETS — in-memory, fastest
+# ETS: in-memory, fastest
 {:ok, ref} = Locker.Store.ETS.init(name: :my_cache)
 
-# DETS — file-backed, persistent, 2GB limit
+# DETS: file-backed, persistent, 2GB limit
 {:ok, ref} = Locker.Store.DETS.init(name: :my_store, path: "/data/store.dets")
 
-# CubDB — B-tree, ACID, no size limit
+# CubDB: B-tree, ACID, no size limit
 {:ok, ref} = Locker.Store.CubDB.init(path: "/data/cubdb")
 
-# JSONL — append-only, human-readable
+# JSONL: append-only, human-readable
 {:ok, ref} = Locker.Store.JSONL.init(path: "/data/audit.jsonl")
 ```
 
@@ -169,11 +169,11 @@ store.close(ref)
 
 ## Architecture
 
-- **WAL is the foundation** — fsync before acknowledge, CRC32 integrity, deterministic replay
-- **Counter is a pattern** — ETS + DETS atomic counters, extracted from repeated implementations
-- **Store is a behaviour** — swap backends without modifying upstream code
-- **No opinions** — each component is independent, use what you need
-- **Config via opts** — no `Application.get_env`, all configuration passed as arguments
+* **WAL is the foundation**: fsync before acknowledge, CRC32 integrity, deterministic replay
+* **Counter is a pattern**: ETS for reads, DETS for durable atomic updates, extracted from repeated implementations
+* **Store is a behaviour**: swap backends without modifying upstream code
+* **Independent components**: nothing depends on anything else; use what you need
+* **Config via opts**: no `Application.get_env`, all configuration passed as arguments
 
 ## Development
 
