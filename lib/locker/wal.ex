@@ -234,8 +234,17 @@ defmodule Locker.WAL do
       new_count = state.entry_count + 1
 
       new_state = %{state | bytes_written: new_bytes, entry_count: new_count}
+      # Per-append header count update dropped: it was a second
+      # fsync per append (seek + write + sync + seek), doubling
+      # latency. The header count is authoritative only in the
+      # "no rotation, clean shutdown" case; the read path
+      # (`read_segment_entries` + `Entry.decode_all`) already
+      # tolerates a stale header count by scanning to EOF, so a
+      # per-append header write buys nothing that the entry stream
+      # itself doesn't already deliver. Header count is refreshed
+      # on segment rotation (below) and on graceful shutdown
+      # (`terminate/2`).
       new_state = maybe_rotate(new_state)
-      update_header_count_with_retry(new_state)
       {:reply, :ok, new_state}
     else
       {:error, reason} ->
@@ -315,6 +324,13 @@ defmodule Locker.WAL do
   def terminate(_reason, state) do
     if state[:fd] do
       try do
+        # Persist final entry_count into the segment header on
+        # graceful shutdown so a subsequent read that keys off the
+        # header (rather than scanning to EOF) sees the exact count.
+        # Not required for correctness — read paths handle a stale
+        # header — but keeps the segment's on-disk metadata clean
+        # after a normal stop.
+        _refresh_result = update_header_count(state)
         :file.sync(state.fd)
         :file.close(state.fd)
       catch

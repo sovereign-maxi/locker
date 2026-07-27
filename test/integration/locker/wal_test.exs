@@ -178,4 +178,75 @@ defmodule Locker.WALTest do
       assert hd(entries).payload == "persistent"
     end
   end
+
+  describe "append latency (per-append fsync only)" do
+    # The per-append handle_call used to fsync the entry write AND
+    # then rewrite + fsync the segment header count on every append —
+    # two fsyncs per append. Since `read_segment_entries` /
+    # `Entry.decode_all` already tolerates a stale header count by
+    # scanning to EOF, the header rewrite was pure latency overhead.
+    # This test asserts that a large append burst produces valid
+    # entries whose count is accurately recoverable from the entry
+    # stream — the correctness guarantee that lets us drop the
+    # per-append header fsync.
+    test "large burst of appends: entry stream is authoritative for count", %{wal_dir: dir} do
+      {pid, name} = start_wal(dir)
+
+      burst = 500
+
+      {us, :ok} =
+        :timer.tc(fn ->
+          for i <- 1..burst do
+            :ok = WAL.append(name, %Entry{type: :write, payload: "burst-#{i}"})
+          end
+
+          :ok
+        end)
+
+      per_us = Float.round(us / burst, 2)
+
+      IO.puts("Locker.WAL.append/2 burst: #{burst} appends in #{us}μs (#{per_us}μs/append)")
+
+      # Kill GenServer HARD so terminate/2's header-refresh doesn't
+      # run: we want the read path to prove itself against a stale
+      # header (or a header the crash-safe branch left at zero).
+      # Unlink first — start_link/1 links the WAL to this test proc.
+      Process.unlink(pid)
+      ref = Process.monitor(pid)
+      Process.exit(pid, :kill)
+
+      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 5_000
+
+      # Boot a fresh GenServer against the same dir. It scans the
+      # last segment and reports entry_count from the entry stream.
+      {_pid2, name2} = start_wal(dir)
+
+      info = WAL.info(name2)
+      assert info.entry_count == burst
+
+      # And read_all returns exactly the same set.
+      {:ok, entries} = WAL.read_all(name2)
+      assert length(entries) == burst
+      assert Enum.map(entries, & &1.payload) == Enum.map(1..burst, &"burst-#{&1}")
+    end
+
+    test "entry-stream count matches Entry.decode_all output regardless of header count",
+         %{wal_dir: dir} do
+      {pid, name} = start_wal(dir)
+
+      for i <- 1..50 do
+        :ok = WAL.append(name, %Entry{type: :write, payload: "e-#{i}"})
+      end
+
+      # Hard-kill (no terminate/2 header refresh). Unlink first —
+      # start_link linked WAL to this test process.
+      Process.unlink(pid)
+      ref = Process.monitor(pid)
+      Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 5_000
+
+      {:ok, entries, 0} = WAL.replay(dir, @byte_map)
+      assert length(entries) == 50
+    end
+  end
 end
