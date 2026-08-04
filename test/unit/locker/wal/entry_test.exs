@@ -245,11 +245,14 @@ defmodule Locker.WAL.EntryTest do
       assert Enum.map(entries, & &1.payload) == [1, 2, 3, 4, 5]
     end
 
-    test "skips entry with unknown type in decode_all" do
-      # Encode a valid entry, then manually construct one with unknown type byte 0xFF
+    test "skips past unknown type in decode_all AND counts corruption" do
+      # Regression: an entry with an unknown type byte used to stop
+      # the loop dead, silently discarding every entry that followed
+      # (older releases' reserved type bytes would truncate the tail
+      # of every segment they lived in). Now: skip past using the
+      # length field, count as corruption so halt-on-corrupt fires.
       good = Entry.encode(%Entry{type: :write, payload: "ok"}, @type_map)
 
-      # Build a valid-CRC entry with unknown type byte
       payload_bin = :erlang.term_to_binary("unknown_payload")
       data = <<0xFF, payload_bin::binary>>
       crc = :erlang.crc32(data)
@@ -260,10 +263,33 @@ defmodule Locker.WAL.EntryTest do
 
       bin = good <> unknown_bin <> good2
       {entries, corrupt_count} = Entry.decode_all(bin, @byte_map)
-      # unknown type causes decode to stop (returns {:error, {:unknown_type, _}})
-      # which hits the catch-all in decode_all and stops processing
-      assert length(entries) >= 1
-      assert corrupt_count == 0
+
+      assert length(entries) == 2, "both known-type entries must survive an unknown-type sandwich"
+      assert Enum.map(entries, & &1.payload) == ["ok", "ok2"]
+      assert corrupt_count == 1, "unknown type MUST be counted as corruption"
+    end
+
+    test "entry_too_large terminates the loop AND counts corruption" do
+      # A flipped bit in the un-CRC-covered length field can push it
+      # above the 16 MB cap. Previous impl silently returned with
+      # corrupt_count = 0, so halt-on-corrupt never fired.
+      bogus = <<0xFF, 0xFF, 0xFF, 0xFF, 0::32>>
+      {entries, corrupt_count} = Entry.decode_all(bogus, @byte_map)
+
+      assert entries == []
+      assert corrupt_count == 1
+    end
+
+    test "incomplete entry terminates the loop AND counts corruption" do
+      # Length says N bytes but only M < N follow — the segment was
+      # truncated. Terminate with corruption count.
+      good = Entry.encode(%Entry{type: :write, payload: "ok"}, @type_map)
+      truncated = binary_part(good, 0, byte_size(good) - 5)
+
+      {entries, corrupt_count} = Entry.decode_all(truncated, @byte_map)
+
+      assert entries == []
+      assert corrupt_count == 1
     end
   end
 
