@@ -84,6 +84,18 @@ defmodule Locker.WAL do
     GenServer.call(server, :read_all, timeout)
   end
 
+  @doc """
+  Strict variant of `read_all/1`. Returns `{:error, {:corrupt_entries,
+  count}}` when any WAL segment contains CRC-bad entries — the lenient
+  `read_all/1` variant silently drops them. Use from boot-replay paths
+  where proceeding with less history than the leader wrote is unsafe.
+  """
+  @spec read_all_strict(GenServer.server(), timeout()) ::
+          {:ok, [Entry.t()]} | {:error, term()}
+  def read_all_strict(server \\ __MODULE__, timeout \\ 30_000) do
+    GenServer.call(server, :read_all_strict, timeout)
+  end
+
   @doc "Writes a checkpoint entry marking all current entries as committed."
   @spec checkpoint(GenServer.server()) :: :ok | {:error, term()}
   def checkpoint(server \\ __MODULE__) do
@@ -257,6 +269,25 @@ defmodule Locker.WAL do
     case replay(state.wal_dir, state.byte_map, skip_corrupt: true) do
       {:ok, entries, _corrupt_count} ->
         {:reply, {:ok, entries}, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call(:read_all_strict, _from, state) do
+    case replay(state.wal_dir, state.byte_map, skip_corrupt: true) do
+      {:ok, entries, 0} ->
+        {:reply, {:ok, entries}, state}
+
+      {:ok, _entries, corrupt_count} when corrupt_count > 0 ->
+        # CRC-bad entries were silently dropped by `read_all/1` for the
+        # convenience of tools/introspection. `read_all_strict/1`
+        # surfaces the corruption so a boot-time caller can fail closed
+        # instead of proceeding with less history — a bit-rotted or
+        # prematurely-pruned leader segment produced a stream with a
+        # silent hole that followers used to skip over forever.
+        {:reply, {:error, {:corrupt_entries, corrupt_count}}, state}
 
       {:error, reason} ->
         {:reply, {:error, reason}, state}
