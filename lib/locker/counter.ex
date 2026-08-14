@@ -9,6 +9,14 @@ defmodule Locker.Counter do
 
   Survives restarts by restoring counter values from DETS on init.
 
+  ## Durability window
+
+  DETS is synced every 5 seconds (and on graceful shutdown), not on
+  every increment — a hard crash can lose up to `sync_interval_ms`
+  of increments. Counters that must never lose increments (liability
+  totals, reserves) must be reconciled against the WAL on boot —
+  e.g. take max(counter, wal_fold) at startup.
+
   ## Usage
 
       {:ok, _pid} = Locker.Counter.start_link(

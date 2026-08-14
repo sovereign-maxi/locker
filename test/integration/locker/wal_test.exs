@@ -29,6 +29,41 @@ defmodule Locker.WALTest do
     {pid, name}
   end
 
+  describe "segment re-creation after header corruption" do
+    test "corrupt segment is quarantined, not truncated", %{wal_dir: dir} do
+      {pid, name} = start_wal(dir)
+
+      :ok =
+        WAL.append(name, %Entry{
+          type: :checkpoint,
+          payload: %{"blob" => String.duplicate("a", 500)}
+        })
+
+      GenServer.stop(pid)
+
+      # Tear the header: zero the first 10 bytes, leave entry bytes intact
+      segment = Path.join(dir, "wal.000001")
+      {:ok, fd} = :file.open(String.to_charlist(segment), [:raw, :binary, :read, :write])
+      :ok = :file.pwrite(fd, 0, :binary.copy(<<0>>, 10))
+      :file.close(fd)
+
+      # Reopening must quarantine the unreadable segment aside — entry
+      # bytes preserved for forensics — and start a fresh segment.
+      {_pid2, name2} = start_wal(dir)
+      :ok = WAL.append(name2, %Entry{type: :checkpoint, payload: %{"blob" => "new"}})
+
+      {:ok, entries, 0} = WAL.replay(dir, @byte_map)
+      assert [%Entry{payload: %{"blob" => "new"}}] = entries
+
+      # The corrupt original survives alongside with its entry bytes intact.
+      corrupt = segment <> ".corrupt"
+      assert File.exists?(corrupt)
+      {:ok, bytes} = File.read(corrupt)
+      assert byte_size(bytes) > 500
+      assert :binary.matches(bytes, String.duplicate("a", 500)) != []
+    end
+  end
+
   describe "append and read_all" do
     test "appends and reads entries", %{wal_dir: dir} do
       {_pid, name} = start_wal(dir)
@@ -161,6 +196,39 @@ defmodule Locker.WALTest do
         |> Enum.filter(&String.starts_with?(&1, "wal."))
 
       assert segments == []
+    end
+  end
+
+  describe "clear/1" do
+    test "empties a live server; subsequent appends land in a fresh segment", %{wal_dir: dir} do
+      {_pid, name} = start_wal(dir)
+
+      :ok = WAL.append(name, %Entry{type: :write, payload: "before-clear"})
+      assert {:ok, [_entry]} = WAL.read_all(name)
+
+      assert :ok = WAL.clear(name)
+      assert {:ok, []} = WAL.read_all(name)
+
+      # The server keeps working: new appends persist and replay sees
+      # only the post-clear generation.
+      :ok = WAL.append(name, %Entry{type: :write, payload: "after-clear"})
+      assert {:ok, [entry]} = WAL.read_all(name)
+      assert entry.payload == "after-clear"
+
+      info = WAL.info(name)
+      assert info.segment_index == 1
+      assert info.entry_count == 1
+    end
+
+    test "a second server booted on the cleared dir sees an empty WAL", %{wal_dir: dir} do
+      {pid, name} = start_wal(dir)
+
+      :ok = WAL.append(name, %Entry{type: :write, payload: "doomed"})
+      assert :ok = WAL.clear(name)
+      GenServer.stop(pid)
+
+      {_pid2, name2} = start_wal(dir)
+      assert {:ok, []} = WAL.read_all(name2)
     end
   end
 

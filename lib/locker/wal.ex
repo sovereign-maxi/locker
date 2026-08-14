@@ -192,6 +192,20 @@ defmodule Locker.WAL do
     :ok
   end
 
+  @doc """
+  Clears all WAL data while the server is running: closes the current
+  segment, deletes every segment file, and reopens a fresh segment 1.
+
+  Unlike `truncate/1` — a directory-level operation that is unsafe
+  under a live server (the process keeps writing to the unlinked
+  file) — this coordinates with the GenServer, so subsequent appends
+  land in the fresh segment and later reads see an empty WAL.
+  """
+  @spec clear(GenServer.server()) :: :ok | {:error, term()}
+  def clear(server \\ __MODULE__) do
+    GenServer.call(server, :clear)
+  end
+
   # --- GenServer Callbacks ---
 
   @impl GenServer
@@ -335,6 +349,27 @@ defmodule Locker.WAL do
     end
   end
 
+  def handle_call(:clear, _from, state) do
+    new_path = segment_path(state.wal_dir, 1)
+
+    with :ok <- safe_close_fd(state.fd),
+         :ok <- truncate(state.wal_dir),
+         {:ok, fd, bytes} <- open_or_create_segment(new_path) do
+      {:reply, :ok,
+       %{
+         state
+         | fd: fd,
+           segment_index: 1,
+           segment_path: new_path,
+           entry_count: 0,
+           bytes_written: bytes,
+           writes_halted: false
+       }}
+    else
+      {:error, reason} -> {:reply, {:error, {:wal_clear_failed, reason}}, state}
+    end
+  end
+
   def handle_call(:info, _from, state) do
     {:reply,
      %{
@@ -420,6 +455,12 @@ defmodule Locker.WAL do
 
   defp maybe_rotate(state), do: state
 
+  defp safe_close_fd(fd) do
+    :file.close(fd)
+  catch
+    _kind, _reason -> :ok
+  end
+
   defp do_rotate(state) do
     new_index = state.segment_index + 1
     new_path = segment_path(state.wal_dir, new_index)
@@ -474,6 +515,7 @@ defmodule Locker.WAL do
 
           _other ->
             :file.close(fd)
+            quarantine_corrupt_segment(path)
             create_new_segment(path)
         end
 
@@ -482,11 +524,44 @@ defmodule Locker.WAL do
     end
   end
 
+  # A segment whose header is unreadable (torn write, bitrot) is
+  # quarantined — renamed aside with a .corrupt suffix — rather than
+  # truncated in place. The entry bytes after the bad header may be
+  # recoverable forensically, and the .corrupt file is the signal
+  # recovery tooling uses to refuse a silent boot. In-place truncation
+  # destroyed exactly the most recent entries, because the WAL process
+  # opens the active segment before any recovery pass can read it.
+  defp quarantine_corrupt_segment(path) do
+    corrupt_path = path <> ".corrupt"
+
+    case File.rename(path, corrupt_path) do
+      :ok ->
+        Logger.error(
+          "WAL: segment #{path} has an unreadable header — quarantined to #{corrupt_path}; " <>
+            "entry bytes preserved for forensics"
+        )
+
+      {:error, reason} ->
+        Logger.error(
+          "WAL: could not quarantine corrupt segment #{path}: #{inspect(reason)} — " <>
+            "falling back to truncate on re-create"
+        )
+    end
+  end
+
   defp create_new_segment(path) do
     header = <<@magic, @version::unsigned-big-16, 0::unsigned-big-32>>
 
+    # Header-corrupt segments reach here only after
+    # quarantine_corrupt_segment/1 has renamed them aside, so the
+    # truncate below is a fallback for a failed rename (and a no-op
+    # for genuinely new files). (:truncate in the open modes is
+    # silently ignored when :read is present, hence the explicit
+    # :file.truncate/1.)
     case :file.open(String.to_charlist(path), [:raw, :binary, :read, :write]) do
       {:ok, fd} ->
+        :ok = :file.truncate(fd)
+
         # Restrict permissions to owner only (0600)
         File.chmod(path, 0o600)
         :ok = :file.write(fd, header)

@@ -23,6 +23,18 @@ defmodule Locker.Store.JSONLTest do
     assert :not_found = JSONL.get(ref, "missing")
   end
 
+  test "read errors raise instead of reading as an empty store", %{ref: ref, path: path} do
+    assert :ok = JSONL.put(ref, "key1", "value1")
+
+    # Replace the file with a directory of the same name — reads then
+    # fail with :eisdir, and must not silently become an empty store
+    # (a subsequent delete/rewrite would wipe real data).
+    File.rm!(path)
+    File.mkdir!(path)
+
+    assert_raise RuntimeError, ~r/unreadable/, fn -> JSONL.get(ref, "key1") end
+  end
+
   test "last write wins", %{ref: ref} do
     JSONL.put(ref, "key1", "first")
     JSONL.put(ref, "key1", "second")

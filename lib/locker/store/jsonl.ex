@@ -33,7 +33,7 @@ defmodule Locker.Store.JSONL do
   def put(ref, key, value) do
     case Jason.encode(%{"k" => key, "v" => value}) do
       {:ok, json} ->
-        File.write!(ref.path, json <> "\n", [:append])
+        File.write!(ref.path, json <> "\n", [:append, :sync])
         :ok
 
       {:error, reason} ->
@@ -53,7 +53,7 @@ defmodule Locker.Store.JSONL do
 
       nil ->
         lines = Enum.map_join(results, "\n", fn {:ok, json} -> json end)
-        File.write!(ref.path, lines <> "\n", [:append])
+        File.write!(ref.path, lines <> "\n", [:append, :sync])
         :ok
     end
   end
@@ -113,8 +113,13 @@ defmodule Locker.Store.JSONL do
             |> String.split("\n", trim: true)
             |> Enum.reduce(%{}, &parse_line/2)
 
-          {:error, _reason} ->
+          {:error, :enoent} ->
             %{}
+
+          {:error, reason} ->
+            # A read error after init must be LOUD — returning an empty
+            # map here would let a later delete/rewrite wipe the file.
+            raise RuntimeError, "JSONL file #{path} unreadable: #{inspect(reason)}"
         end
     end
   end

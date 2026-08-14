@@ -2,6 +2,8 @@
 
 Composable storage primitives for Elixir applications.
 
+Source: [github.com/sovereign-maxi/locker](https://github.com/sovereign-maxi/locker)
+
 ## Installation
 
 Add `locker` to your dependencies in `mix.exs`:
@@ -212,4 +214,4 @@ end
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
