@@ -317,4 +317,127 @@ defmodule Locker.WALTest do
       assert length(entries) == 50
     end
   end
+
+  describe "buffered mode" do
+    test "append returns :ok immediately; entries not on disk until flush", %{wal_dir: dir} do
+      {_pid, name} =
+        start_wal(dir, mode: :buffered, flush_max_entries: 1_000, flush_interval_ms: 60_000)
+
+      for i <- 1..10 do
+        :ok = WAL.append(name, %Entry{type: :write, payload: "e-#{i}"})
+      end
+
+      # Nothing flushed yet — on-disk read sees zero entries.
+      {:ok, on_disk, 0} = WAL.replay(dir, @byte_map)
+      assert on_disk == []
+
+      info = WAL.info(name)
+      assert info.mode == :buffered
+      assert info.buffer_count == 10
+    end
+
+    test "flush drains buffer to disk with one fsync", %{wal_dir: dir} do
+      {_pid, name} =
+        start_wal(dir, mode: :buffered, flush_max_entries: 1_000, flush_interval_ms: 60_000)
+
+      for i <- 1..25 do
+        :ok = WAL.append(name, %Entry{type: :write, payload: "e-#{i}"})
+      end
+
+      :ok = WAL.flush(name)
+
+      {:ok, entries, 0} = WAL.replay(dir, @byte_map)
+      assert length(entries) == 25
+      assert Enum.map(entries, & &1.payload) == Enum.map(1..25, &"e-#{&1}")
+
+      info = WAL.info(name)
+      assert info.buffer_count == 0
+    end
+
+    test "auto-flush triggers when flush_max_entries reached", %{wal_dir: dir} do
+      {_pid, name} =
+        start_wal(dir, mode: :buffered, flush_max_entries: 5, flush_interval_ms: 60_000)
+
+      for i <- 1..12 do
+        :ok = WAL.append(name, %Entry{type: :write, payload: "e-#{i}"})
+      end
+
+      # 5 + 5 = 10 auto-flushed; 2 remain buffered.
+      info = WAL.info(name)
+      assert info.buffer_count == 2
+
+      {:ok, entries, 0} = WAL.replay(dir, @byte_map)
+      assert length(entries) == 10
+    end
+
+    test "append_sync drains buffer + writes given entry durably", %{wal_dir: dir} do
+      {_pid, name} =
+        start_wal(dir, mode: :buffered, flush_max_entries: 1_000, flush_interval_ms: 60_000)
+
+      for i <- 1..8 do
+        :ok = WAL.append(name, %Entry{type: :write, payload: "e-#{i}"})
+      end
+
+      :ok = WAL.append_sync(name, %Entry{type: :write, payload: "sync-9"})
+
+      {:ok, entries, 0} = WAL.replay(dir, @byte_map)
+      assert length(entries) == 9
+      assert List.last(entries).payload == "sync-9"
+
+      info = WAL.info(name)
+      assert info.buffer_count == 0
+    end
+
+    test "flush is a no-op in :sync mode", %{wal_dir: dir} do
+      {_pid, name} = start_wal(dir, mode: :sync)
+      assert :ok = WAL.flush(name)
+    end
+
+    test "append_sync in :sync mode behaves like append", %{wal_dir: dir} do
+      {_pid, name} = start_wal(dir, mode: :sync)
+
+      :ok = WAL.append_sync(name, %Entry{type: :write, payload: "x"})
+
+      {:ok, [entry], 0} = WAL.replay(dir, @byte_map)
+      assert entry.payload == "x"
+    end
+
+    test "periodic flush drains buffer on its own schedule", %{wal_dir: dir} do
+      {_pid, name} =
+        start_wal(dir, mode: :buffered, flush_max_entries: 1_000, flush_interval_ms: 50)
+
+      for i <- 1..4 do
+        :ok = WAL.append(name, %Entry{type: :write, payload: "e-#{i}"})
+      end
+
+      Process.sleep(100)
+
+      {:ok, entries, 0} = WAL.replay(dir, @byte_map)
+      assert length(entries) == 4
+    end
+
+    test "terminate flushes buffer before closing", %{wal_dir: dir} do
+      {pid, name} =
+        start_wal(dir, mode: :buffered, flush_max_entries: 1_000, flush_interval_ms: 60_000)
+
+      for i <- 1..7 do
+        :ok = WAL.append(name, %Entry{type: :write, payload: "e-#{i}"})
+      end
+
+      Process.unlink(pid)
+      GenServer.stop(name, :normal, 5_000)
+
+      {:ok, entries, 0} = WAL.replay(dir, @byte_map)
+      assert length(entries) == 7
+    end
+
+    test "invalid mode raises at init", %{wal_dir: dir} do
+      Process.flag(:trap_exit, true)
+
+      name = :"wal_bogus_#{:erlang.unique_integer([:positive])}"
+
+      assert {:error, {%ArgumentError{}, _stacktrace}} =
+               WAL.start_link(wal_dir: dir, types: @type_map, mode: :bogus, name: name)
+    end
+  end
 end

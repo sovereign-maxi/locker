@@ -18,6 +18,33 @@ defmodule Locker.WAL do
         max_segment_bytes: 64 * 1024 * 1024
       )
 
+  ## Write mode
+
+  Two modes control how `append/2` interacts with disk:
+
+  * `mode: :sync` (default) — every `append/2` writes and fsyncs
+    before returning. Durable across an OS crash; throughput is
+    bounded by fsync latency.
+  * `mode: :buffered` — `append/2` enqueues into an in-memory buffer
+    and returns immediately. The buffer flushes to disk with a
+    single fsync when EITHER `flush_interval_ms` elapses OR
+    `flush_max_entries` accumulate. Callers that need guaranteed
+    durability on a specific write use `append_sync/2` (drains the
+    buffer, writes the entry, fsyncs) or call `flush/1` explicitly.
+
+  Buffered mode extra options (defaults shown):
+
+      mode: :buffered,
+      flush_interval_ms: 500,
+      flush_max_entries: 100
+
+  A flush failure (write or fsync error) in `:buffered` mode is
+  fail-hard: the WAL GenServer stops with `{:flush_failed, reason}`
+  so the supervisor sees it. Entries already acknowledged as `:ok`
+  but not yet flushed are unrecoverable — this is inherent to the
+  write-behind tradeoff and callers who require per-entry
+  durability guarantees must use `append_sync/2`.
+
   ## Binary Format
 
   Each segment file begins with a header:
@@ -52,6 +79,8 @@ defmodule Locker.WAL do
   @version 1
   @header_size 10
   @default_max_segment_bytes 64 * 1024 * 1024
+  @default_flush_interval_ms 500
+  @default_flush_max_entries 100
   @max_rotation_retries 3
   @max_queue_depth 500
   @max_read_bytes 128 * 1024 * 1024
@@ -64,12 +93,40 @@ defmodule Locker.WAL do
     GenServer.start_link(__MODULE__, opts, name: name)
   end
 
-  @doc "Appends an entry to the WAL. The write is fsynced before returning."
+  @doc """
+  Appends an entry to the WAL. In `:sync` mode (default) the write
+  is fsynced before returning. In `:buffered` mode the entry is
+  enqueued and `:ok` is returned immediately; the buffer flushes on
+  its own schedule.
+  """
   @spec append(GenServer.server(), Entry.t()) :: :ok | {:error, term()}
   def append(server \\ __MODULE__, %Entry{} = entry) do
     with :ok <- check_overloaded(server) do
       GenServer.call(server, {:append, entry})
     end
+  end
+
+  @doc """
+  Appends an entry and guarantees it (plus every prior buffered
+  entry) is on disk and fsynced before returning. Behaves identically
+  to `append/2` in `:sync` mode; in `:buffered` mode drains the
+  buffer first.
+  """
+  @spec append_sync(GenServer.server(), Entry.t()) :: :ok | {:error, term()}
+  def append_sync(server \\ __MODULE__, %Entry{} = entry) do
+    with :ok <- check_overloaded(server) do
+      GenServer.call(server, {:append_sync, entry})
+    end
+  end
+
+  @doc """
+  Forces a flush of the buffer + fsync. No-op in `:sync` mode.
+  Useful for callers that want to establish a durability barrier
+  between phases of a batch operation.
+  """
+  @spec flush(GenServer.server()) :: :ok | {:error, term()}
+  def flush(server \\ __MODULE__) do
+    GenServer.call(server, :flush)
   end
 
   @doc """
@@ -217,6 +274,11 @@ defmodule Locker.WAL do
 
     type_map = Keyword.fetch!(opts, :types)
     max_segment = Keyword.get(opts, :max_segment_bytes, @default_max_segment_bytes)
+    mode = Keyword.get(opts, :mode, :sync)
+    validate_mode!(mode)
+
+    flush_interval_ms = Keyword.get(opts, :flush_interval_ms, @default_flush_interval_ms)
+    flush_max_entries = Keyword.get(opts, :flush_max_entries, @default_flush_max_entries)
 
     validate_type_map!(type_map)
     byte_map = Map.new(type_map, fn {k, v} -> {v, k} end)
@@ -227,19 +289,30 @@ defmodule Locker.WAL do
 
     case open_or_create_segment(segment_path) do
       {:ok, fd, actual_bytes} ->
-        {:ok,
-         %{
-           wal_dir: wal_dir,
-           fd: fd,
-           segment_index: segment_index,
-           segment_path: segment_path,
-           entry_count: entry_count,
-           bytes_written: max(bytes_written, actual_bytes),
-           writes_halted: false,
-           type_map: type_map,
-           byte_map: byte_map,
-           max_segment_bytes: max_segment
-         }}
+        state = %{
+          wal_dir: wal_dir,
+          fd: fd,
+          segment_index: segment_index,
+          segment_path: segment_path,
+          entry_count: entry_count,
+          bytes_written: max(bytes_written, actual_bytes),
+          writes_halted: false,
+          type_map: type_map,
+          byte_map: byte_map,
+          max_segment_bytes: max_segment,
+          mode: mode,
+          flush_interval_ms: flush_interval_ms,
+          flush_max_entries: flush_max_entries,
+          # Buffered mode: encoded entry binaries in reverse order
+          # (cheap prepend, reversed on flush). Empty in :sync mode.
+          buffer: [],
+          buffer_count: 0,
+          buffer_bytes: 0
+        }
+
+        if mode == :buffered, do: schedule_periodic_flush(flush_interval_ms)
+
+        {:ok, state}
 
       {:error, reason} ->
         {:stop, {:wal_open_failed, reason}}
@@ -251,31 +324,41 @@ defmodule Locker.WAL do
     {:reply, {:error, :writes_halted}, state}
   end
 
-  def handle_call({:append, entry}, _from, state) do
-    bin = Entry.encode(entry, state.type_map)
+  def handle_call({:append, entry}, _from, %{mode: :sync} = state) do
+    reply_after_sync_write(entry, state)
+  end
 
-    with :ok <- :file.write(state.fd, bin),
-         :ok <- :file.sync(state.fd) do
-      new_bytes = state.bytes_written + byte_size(bin)
-      new_count = state.entry_count + 1
+  def handle_call({:append, entry}, _from, %{mode: :buffered} = state) do
+    reply_after_buffered_write(entry, state)
+  end
 
-      new_state = %{state | bytes_written: new_bytes, entry_count: new_count}
-      # Per-append header count update dropped: it was a second
-      # fsync per append (seek + write + sync + seek), doubling
-      # latency. The header count is authoritative only in the
-      # "no rotation, clean shutdown" case; the read path
-      # (`read_segment_entries` + `Entry.decode_all`) already
-      # tolerates a stale header count by scanning to EOF, so a
-      # per-append header write buys nothing that the entry stream
-      # itself doesn't already deliver. Header count is refreshed
-      # on segment rotation (below) and on graceful shutdown
-      # (`terminate/2`).
-      new_state = maybe_rotate(new_state)
-      {:reply, :ok, new_state}
-    else
-      {:error, reason} ->
-        Logger.error("WAL: write/fsync failed: #{inspect(reason)}")
-        {:reply, {:error, {:wal_write_failed, reason}}, state}
+  def handle_call({:append_sync, _entry}, _from, %{writes_halted: true} = state) do
+    {:reply, {:error, :writes_halted}, state}
+  end
+
+  def handle_call({:append_sync, entry}, _from, %{mode: :sync} = state) do
+    reply_after_sync_write(entry, state)
+  end
+
+  def handle_call({:append_sync, entry}, _from, %{mode: :buffered} = state) do
+    # Drain the buffer first so the caller's guarantee is total
+    # ordering: every entry accepted before this one is durable too.
+    case do_flush(state) do
+      {:ok, flushed_state} -> reply_after_sync_write(entry, flushed_state)
+      {:stop, reason, halted_state} -> {:stop, reason, {:error, reason}, halted_state}
+    end
+  end
+
+  def handle_call(:flush, _from, %{mode: :sync} = state), do: {:reply, :ok, state}
+
+  def handle_call(:flush, _from, %{writes_halted: true} = state) do
+    {:reply, {:error, :writes_halted}, state}
+  end
+
+  def handle_call(:flush, _from, %{mode: :buffered} = state) do
+    case do_flush(state) do
+      {:ok, flushed_state} -> {:reply, :ok, flushed_state}
+      {:stop, reason, halted_state} -> {:stop, reason, {:error, reason}, halted_state}
     end
   end
 
@@ -313,39 +396,24 @@ defmodule Locker.WAL do
   end
 
   def handle_call(:checkpoint, _from, state) do
-    checkpoint_entry = %Entry{
-      type: :checkpoint,
-      payload: %{
-        timestamp: System.system_time(:millisecond),
-        entry_count: state.entry_count,
-        segment_index: state.segment_index
-      }
-    }
-
-    bin = Entry.encode(checkpoint_entry, state.type_map)
-
-    case :file.write(state.fd, bin) do
-      :ok ->
-        :file.sync(state.fd)
-
-        new_state = %{
-          state
-          | bytes_written: state.bytes_written + byte_size(bin),
-            entry_count: state.entry_count + 1
-        }
-
-        update_header_count_with_retry(new_state)
-        {:reply, :ok, new_state}
-
-      {:error, reason} ->
-        {:reply, {:error, {:checkpoint_failed, reason}}, state}
+    # Checkpoint always drains any pending buffered writes first so
+    # the sealed count reflects everything the WAL has accepted.
+    case maybe_drain_buffer(state) do
+      {:ok, drained_state} -> do_checkpoint(drained_state)
+      {:stop, reason, halted_state} -> {:stop, reason, {:error, reason}, halted_state}
     end
   end
 
   def handle_call(:rotate, _from, state) do
-    case do_rotate(state) do
-      {:ok, new_state} -> {:reply, :ok, new_state}
-      {:error, reason} -> {:reply, {:error, reason}, state}
+    case maybe_drain_buffer(state) do
+      {:ok, drained_state} ->
+        case do_rotate(drained_state) do
+          {:ok, new_state} -> {:reply, :ok, new_state}
+          {:error, reason} -> {:reply, {:error, reason}, drained_state}
+        end
+
+      {:stop, reason, halted_state} ->
+        {:stop, reason, {:error, reason}, halted_state}
     end
   end
 
@@ -363,7 +431,10 @@ defmodule Locker.WAL do
            segment_path: new_path,
            entry_count: 0,
            bytes_written: bytes,
-           writes_halted: false
+           writes_halted: false,
+           buffer: [],
+           buffer_count: 0,
+           buffer_bytes: 0
        }}
     else
       {:error, reason} -> {:reply, {:error, {:wal_clear_failed, reason}}, state}
@@ -377,14 +448,27 @@ defmodule Locker.WAL do
        segment_index: state.segment_index,
        segment_path: state.segment_path,
        entry_count: state.entry_count,
-       bytes_written: state.bytes_written
+       bytes_written: state.bytes_written,
+       mode: state.mode,
+       buffer_count: state.buffer_count,
+       buffer_bytes: state.buffer_bytes
      }, state}
   end
 
   @impl GenServer
-  def handle_info(_msg, state) do
-    {:noreply, state}
+  def handle_info(:periodic_flush, %{mode: :buffered} = state) do
+    case do_flush(state) do
+      {:ok, flushed_state} ->
+        schedule_periodic_flush(flushed_state.flush_interval_ms)
+        {:noreply, flushed_state}
+
+      {:stop, reason, halted_state} ->
+        {:stop, reason, halted_state}
+    end
   end
+
+  def handle_info(:periodic_flush, state), do: {:noreply, state}
+  def handle_info(_msg, state), do: {:noreply, state}
 
   @impl GenServer
   def terminate(_reason, state) do
@@ -396,9 +480,15 @@ defmodule Locker.WAL do
         # Not required for correctness — read paths handle a stale
         # header — but keeps the segment's on-disk metadata clean
         # after a normal stop.
-        _refresh_result = update_header_count(state)
-        :file.sync(state.fd)
-        :file.close(state.fd)
+        flushed_state =
+          case do_flush(state) do
+            {:ok, s} -> s
+            {:stop, _reason, s} -> s
+          end
+
+        _refresh_result = update_header_count(flushed_state)
+        :file.sync(flushed_state.fd)
+        :file.close(flushed_state.fd)
       catch
         _kind, _reason -> :ok
       end
@@ -426,6 +516,142 @@ defmodule Locker.WAL do
     case Process.whereis(server) do
       nil -> {:error, :not_running}
       pid -> check_overloaded(pid)
+    end
+  end
+
+  defp validate_mode!(:sync), do: :ok
+  defp validate_mode!(:buffered), do: :ok
+
+  defp validate_mode!(other),
+    do: raise(ArgumentError, "WAL :mode must be :sync or :buffered (got: #{inspect(other)})")
+
+  defp schedule_periodic_flush(interval_ms) do
+    Process.send_after(self(), :periodic_flush, interval_ms)
+  end
+
+  # Sync-write path: write + fsync + rotate check + reply :ok.
+  # Shared by :sync mode's append and :buffered mode's append_sync.
+  defp reply_after_sync_write(entry, state) do
+    bin = Entry.encode(entry, state.type_map)
+
+    with :ok <- :file.write(state.fd, bin),
+         :ok <- :file.sync(state.fd) do
+      new_state = %{
+        state
+        | bytes_written: state.bytes_written + byte_size(bin),
+          entry_count: state.entry_count + 1
+      }
+
+      # Per-append header count update dropped: it was a second
+      # fsync per append (seek + write + sync + seek), doubling
+      # latency. The header count is authoritative only in the
+      # "no rotation, clean shutdown" case; the read path
+      # (`read_segment_entries` + `Entry.decode_all`) already
+      # tolerates a stale header count by scanning to EOF, so a
+      # per-append header write buys nothing that the entry stream
+      # itself doesn't already deliver. Header count is refreshed
+      # on segment rotation (below) and on graceful shutdown
+      # (`terminate/2`).
+      new_state = maybe_rotate(new_state)
+      {:reply, :ok, new_state}
+    else
+      {:error, reason} ->
+        Logger.error("WAL: write/fsync failed: #{inspect(reason)}")
+        {:reply, {:error, {:wal_write_failed, reason}}, state}
+    end
+  end
+
+  # Buffered-write path: enqueue + return :ok. Auto-flushes when
+  # the buffer hits the entry-count ceiling.
+  defp reply_after_buffered_write(entry, state) do
+    bin = Entry.encode(entry, state.type_map)
+    bin_size = byte_size(bin)
+
+    new_state = %{
+      state
+      | buffer: [bin | state.buffer],
+        buffer_count: state.buffer_count + 1,
+        buffer_bytes: state.buffer_bytes + bin_size
+    }
+
+    if new_state.buffer_count >= new_state.flush_max_entries do
+      case do_flush(new_state) do
+        {:ok, flushed_state} -> {:reply, :ok, flushed_state}
+        {:stop, reason, halted_state} -> {:stop, reason, {:error, reason}, halted_state}
+      end
+    else
+      {:reply, :ok, new_state}
+    end
+  end
+
+  # Drain the buffer with one write + one fsync. Returns
+  # `{:ok, state'}` on success or `{:stop, reason, state'}` on
+  # failure — buffered-mode flush failures are fail-hard because
+  # entries the caller was told :ok on can never be recovered.
+  defp do_flush(%{buffer: []} = state), do: {:ok, state}
+
+  defp do_flush(state) do
+    # Reverse to write-order (buffer is prepended for cheap enqueue).
+    entries = Enum.reverse(state.buffer)
+    flushed_count = state.buffer_count
+    flushed_bytes = state.buffer_bytes
+
+    with :ok <- :file.write(state.fd, entries),
+         :ok <- :file.sync(state.fd) do
+      new_state = %{
+        state
+        | buffer: [],
+          buffer_count: 0,
+          buffer_bytes: 0,
+          bytes_written: state.bytes_written + flushed_bytes,
+          entry_count: state.entry_count + flushed_count
+      }
+
+      {:ok, maybe_rotate(new_state)}
+    else
+      {:error, reason} ->
+        Logger.error(
+          "WAL: buffered flush of #{flushed_count} entries failed: #{inspect(reason)} — halting"
+        )
+
+        halted_state = %{state | writes_halted: true}
+        {:stop, {:flush_failed, reason}, halted_state}
+    end
+  end
+
+  # Used by paths that need to reason about a clean on-disk state
+  # (checkpoint, rotate) — flushes pending buffer if any.
+  defp maybe_drain_buffer(%{mode: :sync} = state), do: {:ok, state}
+  defp maybe_drain_buffer(%{buffer: []} = state), do: {:ok, state}
+  defp maybe_drain_buffer(state), do: do_flush(state)
+
+  defp do_checkpoint(state) do
+    checkpoint_entry = %Entry{
+      type: :checkpoint,
+      payload: %{
+        timestamp: System.system_time(:millisecond),
+        entry_count: state.entry_count,
+        segment_index: state.segment_index
+      }
+    }
+
+    bin = Entry.encode(checkpoint_entry, state.type_map)
+
+    case :file.write(state.fd, bin) do
+      :ok ->
+        :file.sync(state.fd)
+
+        new_state = %{
+          state
+          | bytes_written: state.bytes_written + byte_size(bin),
+            entry_count: state.entry_count + 1
+        }
+
+        update_header_count_with_retry(new_state)
+        {:reply, :ok, new_state}
+
+      {:error, reason} ->
+        {:reply, {:error, {:checkpoint_failed, reason}}, state}
     end
   end
 
