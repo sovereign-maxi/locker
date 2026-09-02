@@ -98,11 +98,15 @@ defmodule Locker.WAL do
   is fsynced before returning. In `:buffered` mode the entry is
   enqueued and `:ok` is returned immediately; the buffer flushes on
   its own schedule.
+
+  `timeout` bounds the GenServer call (default 5s). Writers on
+  money-commit paths should pass a generous timeout so a slow
+  fsync stalls the caller instead of exiting it mid-commit.
   """
-  @spec append(GenServer.server(), Entry.t()) :: :ok | {:error, term()}
-  def append(server \\ __MODULE__, %Entry{} = entry) do
+  @spec append(GenServer.server(), Entry.t(), timeout()) :: :ok | {:error, term()}
+  def append(server \\ __MODULE__, %Entry{} = entry, timeout \\ 5_000) do
     with :ok <- check_overloaded(server) do
-      GenServer.call(server, {:append, entry})
+      GenServer.call(server, {:append, entry}, timeout)
     end
   end
 
@@ -110,12 +114,37 @@ defmodule Locker.WAL do
   Appends an entry and guarantees it (plus every prior buffered
   entry) is on disk and fsynced before returning. Behaves identically
   to `append/2` in `:sync` mode; in `:buffered` mode drains the
-  buffer first.
+  buffer first. Accepts the same optional call timeout as `append/3`.
   """
-  @spec append_sync(GenServer.server(), Entry.t()) :: :ok | {:error, term()}
-  def append_sync(server \\ __MODULE__, %Entry{} = entry) do
+  @spec append_sync(GenServer.server(), Entry.t(), timeout()) :: :ok | {:error, term()}
+  def append_sync(server \\ __MODULE__, %Entry{} = entry, timeout \\ 5_000) do
     with :ok <- check_overloaded(server) do
-      GenServer.call(server, {:append_sync, entry})
+      GenServer.call(server, {:append_sync, entry}, timeout)
+    end
+  end
+
+  @doc """
+  Appends a batch of entries ATOMICALLY: every entry is encoded
+  upfront, then the whole batch lands with a single write + fsync
+  (in `:sync` mode) or as one enqueued group (in `:buffered` mode,
+  flushed per the WAL's own schedule). Either every entry in the
+  batch becomes durable or none does — a mid-batch failure can
+  never leave a durable prefix behind.
+
+  Returns `:ok` or `{:error, reason}`. An encoding failure on any
+  entry (unknown type, oversized payload) aborts the whole batch
+  before anything is written. A write/fsync failure returns
+  `{:error, {:wal_write_failed, reason}}`; because the batch is a
+  single write, a failure there can at worst leave a torn byte
+  tail (flagged as corruption by `read_all_strict/1`), never a
+  valid partial entry.
+
+  `timeout` bounds the GenServer call (default 5s).
+  """
+  @spec append_batch(GenServer.server(), [Entry.t()], timeout()) :: :ok | {:error, term()}
+  def append_batch(server \\ __MODULE__, entries, timeout \\ 5_000) when is_list(entries) do
+    with :ok <- check_overloaded(server) do
+      GenServer.call(server, {:append_batch, entries}, timeout)
     end
   end
 
@@ -123,10 +152,20 @@ defmodule Locker.WAL do
   Forces a flush of the buffer + fsync. No-op in `:sync` mode.
   Useful for callers that want to establish a durability barrier
   between phases of a batch operation.
+
+  `timeout` bounds the GenServer call (default 5s). Callers on
+  money-commit paths should pass their commit budget explicitly —
+  a stalled fsync must surface at the caller's own boundary, not
+  as a surprise 5s exit mid-commit.
+
+  Note that `read_all/2` / `read_all_strict/2` replay from disk
+  only: in `:buffered` mode an accepted entry is invisible to reads
+  until a flush (periodic or explicit) lands it. A reader that must
+  observe everything written so far flushes first.
   """
-  @spec flush(GenServer.server()) :: :ok | {:error, term()}
-  def flush(server \\ __MODULE__) do
-    GenServer.call(server, :flush)
+  @spec flush(GenServer.server(), timeout()) :: :ok | {:error, term()}
+  def flush(server \\ __MODULE__, timeout \\ 5_000) do
+    GenServer.call(server, :flush, timeout)
   end
 
   @doc """
@@ -347,6 +386,18 @@ defmodule Locker.WAL do
       {:ok, flushed_state} -> reply_after_sync_write(entry, flushed_state)
       {:stop, reason, halted_state} -> {:stop, reason, {:error, reason}, halted_state}
     end
+  end
+
+  def handle_call({:append_batch, _entries}, _from, %{writes_halted: true} = state) do
+    {:reply, {:error, :writes_halted}, state}
+  end
+
+  def handle_call({:append_batch, entries}, _from, %{mode: :sync} = state) do
+    reply_after_sync_batch_write(entries, state)
+  end
+
+  def handle_call({:append_batch, entries}, _from, %{mode: :buffered} = state) do
+    reply_after_buffered_batch_write(entries, state)
   end
 
   def handle_call(:flush, _from, %{mode: :sync} = state), do: {:reply, :ok, state}
@@ -582,6 +633,74 @@ defmodule Locker.WAL do
     else
       {:reply, :ok, new_state}
     end
+  end
+
+  # Atomic batch path for :sync mode: encode ALL entries first
+  # (an encode failure aborts before anything is written), then a
+  # single write + fsync for the whole batch. The batch either
+  # lands in full or not at all — no durable prefix can strand
+  # behind a mid-batch per-entry failure.
+  defp reply_after_sync_batch_write(entries, state) do
+    with {:ok, bins} <- encode_all(entries, state.type_map),
+         :ok <- :file.write(state.fd, bins),
+         :ok <- :file.sync(state.fd) do
+      new_state = %{
+        state
+        | bytes_written: state.bytes_written + IO.iodata_length(bins),
+          entry_count: state.entry_count + length(entries)
+      }
+
+      new_state = maybe_rotate(new_state)
+      {:reply, :ok, new_state}
+    else
+      {:error, {:encode_failed, _reason}} = err ->
+        {:reply, err, state}
+
+      {:error, reason} ->
+        Logger.error("WAL: batch write/fsync failed: #{inspect(reason)}")
+        {:reply, {:error, {:wal_write_failed, reason}}, state}
+    end
+  end
+
+  # Atomic batch path for :buffered mode: encode everything upfront
+  # (aborting cleanly on a bad entry), then enqueue the batch as one
+  # group. The buffer flushes as a single write, so the batch can
+  # never be split across flushes by per-entry arrivals from other
+  # callers — this handler runs inside the GenServer, so no flush
+  # can interleave mid-enqueue.
+  defp reply_after_buffered_batch_write(entries, state) do
+    case encode_all(entries, state.type_map) do
+      {:ok, bins} ->
+        batch_bytes = IO.iodata_length(bins)
+
+        new_state = %{
+          state
+          | buffer: Enum.reverse(bins) ++ state.buffer,
+            buffer_count: state.buffer_count + length(entries),
+            buffer_bytes: state.buffer_bytes + batch_bytes
+        }
+
+        if new_state.buffer_count >= new_state.flush_max_entries do
+          case do_flush(new_state) do
+            {:ok, flushed_state} -> {:reply, :ok, flushed_state}
+            {:stop, reason, halted_state} -> {:stop, reason, {:error, reason}, halted_state}
+          end
+        else
+          {:reply, :ok, new_state}
+        end
+
+      {:error, _reason} = err ->
+        {:reply, err, state}
+    end
+  end
+
+  # Encodes every entry or none: the first encode failure returns
+  # `{:error, {:encode_failed, reason}}` with no partial result so
+  # batch callers abort before any write reaches the segment.
+  defp encode_all(entries, type_map) do
+    {:ok, Enum.map(entries, &Entry.encode(&1, type_map))}
+  rescue
+    e -> {:error, {:encode_failed, Exception.message(e)}}
   end
 
   # Drain the buffer with one write + one fsync. Returns
