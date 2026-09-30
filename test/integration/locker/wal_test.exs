@@ -48,8 +48,10 @@ defmodule Locker.WALTest do
       :file.close(fd)
 
       # Reopening must quarantine the unreadable segment aside — entry
-      # bytes preserved for forensics — and start a fresh segment.
-      {_pid2, name2} = start_wal(dir)
+      # bytes preserved for forensics — and start a fresh segment. The
+      # halt-on-corrupt boot check fires on the NEXT boot (after the
+      # `.corrupt` file exists), not this one.
+      {pid2, name2} = start_wal(dir)
       :ok = WAL.append(name2, %Entry{type: :checkpoint, payload: %{"blob" => "new"}})
 
       {:ok, entries, 0} = WAL.replay(dir, @byte_map)
@@ -61,6 +63,42 @@ defmodule Locker.WALTest do
       {:ok, bytes} = File.read(corrupt)
       assert byte_size(bytes) > 500
       assert :binary.matches(bytes, String.duplicate("a", 500)) != []
+
+      GenServer.stop(pid2)
+    end
+
+    test "subsequent boot with a `.corrupt` segment on disk refuses to start", %{wal_dir: dir} do
+      {pid, name} = start_wal(dir)
+      :ok = WAL.append(name, %Entry{type: :checkpoint, payload: %{"blob" => "seeded"}})
+      GenServer.stop(pid)
+
+      # Simulate a prior boot's quarantine result.
+      corrupt_path = Path.join(dir, "wal.000001.corrupt")
+      File.rename!(Path.join(dir, "wal.000001"), corrupt_path)
+
+      # Locker.WAL.start_link raises via init's `halt_on_corrupt_segments!`;
+      # GenServer converts the raise into `{:error, {reason, stacktrace}}`.
+      # Trap exits so the linked-process death doesn't take the test out.
+      Process.flag(:trap_exit, true)
+
+      assert {:error, {%RuntimeError{message: msg}, _stack}} =
+               WAL.start_link(
+                 name: :"locker_test_wal_halt_#{:erlang.unique_integer([:positive])}",
+                 wal_dir: dir,
+                 types: %{checkpoint: 0x01, write: 0x02, delete: 0x03}
+               )
+
+      assert msg =~ "`.corrupt` segments"
+
+      Process.flag(:trap_exit, false)
+
+      # Operator acknowledgement (remove the `.corrupt` marker) unblocks
+      # boot — the sealed entries stay preserved as long as the marker
+      # is renamed to a non-`.corrupt` name or copied elsewhere first.
+      File.rm!(corrupt_path)
+
+      {pid2, _name2} = start_wal(dir)
+      GenServer.stop(pid2)
     end
   end
 

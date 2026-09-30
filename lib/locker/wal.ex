@@ -323,6 +323,8 @@ defmodule Locker.WAL do
     byte_map = Map.new(type_map, fn {k, v} -> {v, k} end)
     File.mkdir_p!(wal_dir)
 
+    :ok = halt_on_corrupt_segments!(wal_dir)
+
     {segment_index, entry_count, bytes_written} = scan_existing_segments(wal_dir, byte_map)
     segment_path = segment_path(wal_dir, segment_index)
 
@@ -978,6 +980,43 @@ defmodule Locker.WAL do
 
       {:error, _reason} ->
         []
+    end
+  end
+
+  # Header-corrupt segments are renamed aside with a `.corrupt` suffix
+  # (see `quarantine_corrupt_segment/1`) so entry bytes stay preserved
+  # for forensic recovery. Their presence means a prior boot detected
+  # bit-level damage in the sealed history and silently continued —
+  # money-state may already have re-materialised wrong. Refuse to open
+  # the WAL until an operator has reviewed and either restored the
+  # segment or deliberately cleared the marker.
+  defp halt_on_corrupt_segments!(wal_dir) do
+    case File.ls(wal_dir) do
+      {:ok, files} ->
+        corrupt =
+          files
+          |> Enum.filter(&Regex.match?(~r/^wal\.\d+\.corrupt$/, &1))
+          |> Enum.sort()
+
+        if corrupt == [] do
+          :ok
+        else
+          full = Enum.map(corrupt, &Path.join(wal_dir, &1))
+
+          raise """
+          Locker.WAL: found quarantined `.corrupt` segments in #{wal_dir} \
+          (#{Enum.join(full, ", ")}). A prior boot detected a header-\
+          corrupt segment and renamed it aside while creating a fresh \
+          segment at the same index — sealed entries in the quarantined \
+          file never re-materialised. Refusing to start until the segments \
+          are reviewed. Investigate the entry bytes for money-state impact, \
+          then either restore the segment or (deliberately) remove the \
+          `.corrupt` file to acknowledge the loss.
+          """
+        end
+
+      {:error, _reason} ->
+        :ok
     end
   end
 
