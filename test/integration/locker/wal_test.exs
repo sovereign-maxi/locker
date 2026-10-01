@@ -30,7 +30,7 @@ defmodule Locker.WALTest do
   end
 
   describe "segment re-creation after header corruption" do
-    test "corrupt segment is quarantined, not truncated", %{wal_dir: dir} do
+    test "first-detection boot halts loudly AND quarantines the corrupt segment", %{wal_dir: dir} do
       {pid, name} = start_wal(dir)
 
       :ok =
@@ -47,24 +47,32 @@ defmodule Locker.WALTest do
       :ok = :file.pwrite(fd, 0, :binary.copy(<<0>>, 10))
       :file.close(fd)
 
-      # Reopening must quarantine the unreadable segment aside — entry
-      # bytes preserved for forensics — and start a fresh segment. The
-      # halt-on-corrupt boot check fires on the NEXT boot (after the
-      # `.corrupt` file exists), not this one.
-      {pid2, name2} = start_wal(dir)
-      :ok = WAL.append(name2, %Entry{type: :checkpoint, payload: %{"blob" => "new"}})
+      # First-detection boot MUST halt — torn writes can't produce a
+      # corrupt header (entry CRC covers torn tails), so a bad header
+      # indicates bitrot / backup corruption / tampering, and silently
+      # quarantining-and-continuing would drop sealed history for a
+      # boot before the next boot's halt-on-corrupt check fires.
+      Process.flag(:trap_exit, true)
 
-      {:ok, entries, 0} = WAL.replay(dir, @byte_map)
-      assert [%Entry{payload: %{"blob" => "new"}}] = entries
+      assert {:error, {%RuntimeError{message: msg}, _stack}} =
+               WAL.start_link(
+                 name: :"locker_test_wal_first_detect_#{:erlang.unique_integer([:positive])}",
+                 wal_dir: dir,
+                 types: %{checkpoint: 0x01, write: 0x02, delete: 0x03}
+               )
 
-      # The corrupt original survives alongside with its entry bytes intact.
+      assert msg =~ "header-corrupt segment"
+
+      Process.flag(:trap_exit, false)
+
+      # The corrupt original survives alongside with its entry bytes intact —
+      # quarantine ran before the halt so forensic recovery still has the
+      # sealed entries.
       corrupt = segment <> ".corrupt"
       assert File.exists?(corrupt)
       {:ok, bytes} = File.read(corrupt)
       assert byte_size(bytes) > 500
       assert :binary.matches(bytes, String.duplicate("a", 500)) != []
-
-      GenServer.stop(pid2)
     end
 
     test "subsequent boot with a `.corrupt` segment on disk refuses to start", %{wal_dir: dir} do

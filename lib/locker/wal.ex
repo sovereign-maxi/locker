@@ -862,8 +862,7 @@ defmodule Locker.WAL do
 
           _other ->
             :file.close(fd)
-            quarantine_corrupt_segment(path)
-            create_new_segment(path)
+            quarantine_and_halt!(path)
         end
 
       {:error, reason} ->
@@ -872,28 +871,42 @@ defmodule Locker.WAL do
   end
 
   # A segment whose header is unreadable (torn write, bitrot) is
-  # quarantined — renamed aside with a .corrupt suffix — rather than
-  # truncated in place. The entry bytes after the bad header may be
-  # recoverable forensically, and the .corrupt file is the signal
-  # recovery tooling uses to refuse a silent boot. In-place truncation
-  # destroyed exactly the most recent entries, because the WAL process
-  # opens the active segment before any recovery pass can read it.
-  defp quarantine_corrupt_segment(path) do
+  # quarantined AND the boot is halted at first detection. The entry
+  # bytes after the bad header may be recoverable forensically, and
+  # the .corrupt file is the signal recovery tooling uses to refuse
+  # a silent boot. Halting on first detection (rather than only on
+  # the next boot) matters because torn writes can't produce a
+  # corrupt header — entry CRC covers torn tails — so an immediate
+  # halt is safe and surfaces the problem loudly instead of letting
+  # the venue silently drop sealed history for a boot.
+  defp quarantine_and_halt!(path) do
     corrupt_path = path <> ".corrupt"
 
-    case File.rename(path, corrupt_path) do
-      :ok ->
-        Logger.error(
-          "WAL: segment #{path} has an unreadable header — quarantined to #{corrupt_path}; " <>
-            "entry bytes preserved for forensics"
-        )
+    rename_result =
+      case File.rename(path, corrupt_path) do
+        :ok ->
+          Logger.error(
+            "WAL: segment #{path} has an unreadable header — quarantined to #{corrupt_path}; " <>
+              "entry bytes preserved for forensics"
+          )
 
-      {:error, reason} ->
-        Logger.error(
-          "WAL: could not quarantine corrupt segment #{path}: #{inspect(reason)} — " <>
-            "falling back to truncate on re-create"
-        )
-    end
+          {:quarantined, corrupt_path}
+
+        {:error, reason} ->
+          Logger.error("WAL: could not quarantine corrupt segment #{path}: #{inspect(reason)}")
+
+          {:rename_failed, reason}
+      end
+
+    raise """
+    Locker.WAL: detected a header-corrupt segment at #{path} \
+    (#{inspect(rename_result)}). Refusing to continue — a torn write \
+    cannot produce a corrupt header (entry CRC covers torn tails), \
+    so this indicates bitrot, backup corruption, or a tampering attempt. \
+    Entry bytes are preserved for forensics. Investigate the quarantined \
+    file for money-state impact before restarting; the subsequent boot \
+    will refuse until the `.corrupt` marker is deliberately removed.
+    """
   end
 
   defp create_new_segment(path) do
