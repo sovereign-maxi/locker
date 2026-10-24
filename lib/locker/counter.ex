@@ -34,8 +34,6 @@ defmodule Locker.Counter do
 
   use GenServer
 
-  require Logger
-
   @dets_sync_interval_ms 5_000
 
   # --- Public API ---

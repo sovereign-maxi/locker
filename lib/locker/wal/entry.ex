@@ -26,8 +26,6 @@ defmodule Locker.WAL.Entry do
   modifying Locker. The only reserved type is `:checkpoint` (0x06).
   """
 
-  require Logger
-
   defstruct [:type, :payload, :crc]
 
   @type t :: %__MODULE__{
@@ -82,7 +80,7 @@ defmodule Locker.WAL.Entry do
         byte_map
       )
       when byte_size(rest) >= length do
-    <<data::binary-size(length), remaining::binary>> = rest
+    <<data::binary-size(^length), remaining::binary>> = rest
     computed_crc = :erlang.crc32(data)
 
     if computed_crc == crc do
@@ -177,7 +175,7 @@ defmodule Locker.WAL.Entry do
     <<length::unsigned-big-32, _crc::unsigned-big-32, rest::binary>> = data
 
     if byte_size(rest) >= length do
-      <<_skipped::binary-size(length), remaining::binary>> = rest
+      <<_skipped::binary-size(^length), remaining::binary>> = rest
       decode_all(remaining, byte_map, acc, corrupt_count + 1)
     else
       {Enum.reverse(acc), corrupt_count + 1}
