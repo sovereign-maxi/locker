@@ -75,6 +75,12 @@ defmodule Locker.WAL do
 
   require Logger
 
+  @typedoc "Byte position within a numbered WAL segment."
+  @type cursor :: {non_neg_integer(), non_neg_integer()}
+
+  @typedoc "A bounded page of strictly decoded entries."
+  @type read_page :: %{entries: [Entry.t()], cursor: cursor(), eof?: boolean()}
+
   @magic "LWAL"
   @version 1
   @header_size 10
@@ -123,6 +129,10 @@ defmodule Locker.WAL do
     end
   end
 
+  @doc "Returns whether this writer currently accepts durable appends."
+  @spec writer_status(GenServer.server()) :: :ok | :writes_halted
+  def writer_status(server \\ __MODULE__), do: GenServer.call(server, :writer_status)
+
   @doc """
   Appends a batch of entries ATOMICALLY: every entry is encoded
   upfront, then the whole batch lands with a single write + fsync
@@ -166,6 +176,23 @@ defmodule Locker.WAL do
   @spec flush(GenServer.server(), timeout()) :: :ok | {:error, term()}
   def flush(server \\ __MODULE__, timeout \\ 5_000) do
     GenServer.call(server, :flush, timeout)
+  end
+
+  @doc """
+  Reads at most `max_entries` entries after a segment/byte cursor.
+
+  The server drains buffered appends first and serialises the read with
+  active writers, so every returned record is complete. The next cursor
+  advances only across CRC-valid, fully decoded entries. Calls are also
+  bounded to roughly 1 MiB of entry bytes, except that one entry is
+  always allowed to make progress.
+  """
+  @spec read_from(GenServer.server(), :start | cursor(), pos_integer(), non_neg_integer() | nil) ::
+          {:ok, read_page()} | {:error, term()}
+  def read_from(server, cursor, max_entries \\ 500, max_seq \\ nil)
+      when (cursor == :start or is_tuple(cursor)) and is_integer(max_entries) and max_entries > 0 and
+             (is_nil(max_seq) or (is_integer(max_seq) and max_seq >= 0)) do
+    GenServer.call(server, {:read_from, cursor, max_entries, max_seq}, 30_000)
   end
 
   @doc """
@@ -361,6 +388,10 @@ defmodule Locker.WAL do
   end
 
   @impl GenServer
+  def handle_call(:writer_status, _from, state) do
+    {:reply, state.writes_halted, state}
+  end
+
   def handle_call({:append, _entry}, _from, %{writes_halted: true} = state) do
     {:reply, {:error, :writes_halted}, state}
   end
@@ -441,6 +472,18 @@ defmodule Locker.WAL do
 
       {:error, reason} ->
         {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:read_from, cursor, max_entries, max_seq}, _from, state) do
+    case maybe_drain_buffer(state) do
+      {:ok, drained_state} ->
+        initial_cursor = if cursor == :start, do: {1, @header_size}, else: cursor
+        read_state = Map.put(drained_state, :read_max_seq, max_seq)
+        {:reply, read_page(read_state, initial_cursor, max_entries), drained_state}
+
+      {:stop, reason, halted_state} ->
+        {:stop, reason, {:error, reason}, halted_state}
     end
   end
 
@@ -1058,6 +1101,121 @@ defmodule Locker.WAL do
       raise ArgumentError,
             "WAL type_map must include :checkpoint type (required for checkpoint/1)"
     end
+  end
+
+  defp read_page(state, {index, offset}, max_entries)
+       when is_integer(index) and index >= 1 and is_integer(offset) and offset >= @header_size do
+    path = segment_path(state.wal_dir, index)
+
+    if File.exists?(path) do
+      case :file.open(String.to_charlist(path), [:raw, :binary, :read]) do
+        {:ok, fd} ->
+          try do
+            case :file.read(fd, @header_size) do
+              {:ok, <<@magic, @version::unsigned-big-16, _count::unsigned-big-32>>} ->
+                read_fd_entries(fd, state, {index, offset}, max_entries, %{entries: [], bytes: 0})
+
+              _other ->
+                {:error, {:invalid_header, path}}
+            end
+          after
+            :file.close(fd)
+          end
+
+        {:error, reason} ->
+          {:error, {:segment_open_failed, path, reason}}
+      end
+    else
+      {:error, {:segment_missing, path}}
+    end
+  end
+
+  defp read_page(_state, cursor, _max_entries), do: {:error, {:invalid_cursor, cursor}}
+
+  defp read_fd_entries(fd, state, {index, offset} = cursor, 0, acc) do
+    at_eof? = match?(:eof, :file.pread(fd, offset, 1))
+    next_path = segment_path(state.wal_dir, index + 1)
+    page_response(acc.entries, cursor, at_eof? and not File.exists?(next_path))
+  end
+
+  defp read_fd_entries(fd, state, {index, offset} = cursor, remaining, acc) do
+    path = segment_path(state.wal_dir, index)
+
+    case :file.pread(fd, offset, 8) do
+      :eof ->
+        next_path = segment_path(state.wal_dir, index + 1)
+
+        if acc.entries == [] and File.exists?(next_path) do
+          read_page(state, {index + 1, @header_size}, remaining)
+        else
+          page_response(acc.entries, cursor, not File.exists?(next_path))
+        end
+
+      {:ok, <<length::unsigned-big-32, _crc::unsigned-big-32>>} ->
+        entry_bytes = length + 8
+
+        cond do
+          length > 16 * 1024 * 1024 ->
+            {:error, {:entry_too_large, length}}
+
+          acc.entries != [] and acc.bytes + entry_bytes > 1024 * 1024 ->
+            page_response(acc.entries, cursor, false)
+
+          true ->
+            case decode_next_entry(fd, state.byte_map, path, cursor, entry_bytes) do
+              {:ok, entry} ->
+                if beyond_cutoff?(entry, state.read_max_seq) do
+                  page_response(acc.entries, cursor, false)
+                else
+                  next_acc = %{entries: [entry | acc.entries], bytes: acc.bytes + entry_bytes}
+
+                  read_fd_entries(
+                    fd,
+                    state,
+                    {index, offset + entry_bytes},
+                    remaining - 1,
+                    next_acc
+                  )
+                end
+
+              {:error, _reason} = error ->
+                error
+            end
+        end
+
+      {:ok, _partial} ->
+        {:error, {:incomplete_entry_header, path, offset}}
+
+      {:error, reason} ->
+        {:error, {:segment_read_failed, path, reason}}
+    end
+  end
+
+  defp beyond_cutoff?(_entry, nil), do: false
+
+  defp beyond_cutoff?(%Entry{payload: %{seq: seq}}, max_seq) when is_integer(seq),
+    do: seq > max_seq
+
+  defp beyond_cutoff?(_entry, _max_seq), do: false
+
+  defp decode_next_entry(fd, byte_map, path, {index, offset} = cursor, entry_bytes) do
+    case :file.pread(fd, offset, entry_bytes) do
+      {:ok, record} when byte_size(record) == entry_bytes ->
+        case Entry.decode(record, byte_map) do
+          {:ok, entry, <<>>, false} -> {:ok, entry}
+          {:ok, _entry, <<>>, true} -> {:error, {:corrupt_entry, path, cursor}}
+          {:ok, _entry, _rest, _corrupted} -> {:error, {:invalid_entry_length, path, cursor}}
+          {:error, reason} -> {:error, {:corrupt_entry, path, cursor, reason}}
+        end
+
+      _other ->
+        {:error, {:incomplete_entry, path, {index, offset}}}
+    end
+  end
+
+  defp page_response(acc, cursor, eof?) do
+    entries = Enum.reverse(acc)
+    {:ok, %{entries: entries, cursor: cursor, eof?: eof?}}
   end
 
   defp read_segment_entries(path, byte_map) do

@@ -486,4 +486,74 @@ defmodule Locker.WALTest do
                WAL.start_link(wal_dir: dir, types: @type_map, mode: :bogus, name: name)
     end
   end
+
+  describe "read_from/3" do
+    test "walks buffered entries and rotations in bounded resumable pages", %{wal_dir: dir} do
+      {_pid, name} =
+        start_wal(dir,
+          mode: :buffered,
+          flush_interval_ms: 60_000,
+          flush_max_entries: 1_000,
+          max_segment_bytes: 300
+        )
+
+      for i <- 1..12 do
+        :ok =
+          WAL.append(name, %Entry{type: :write, payload: %{n: i, blob: String.duplicate("x", 30)}})
+      end
+
+      assert {:ok, first} = WAL.read_from(name, :start, 5)
+      assert length(first.entries) == 5
+      refute first.eof?
+
+      assert {:ok, second} = WAL.read_from(name, first.cursor, 5)
+      assert length(second.entries) == 5
+
+      assert {:ok, third} = WAL.read_from(name, second.cursor, 5)
+      assert length(third.entries) == 2
+      refute third.eof?
+
+      assert Enum.map(first.entries ++ second.entries ++ third.entries, & &1.payload.n) ==
+               Enum.to_list(1..12)
+
+      assert {:ok, fourth} = WAL.read_from(name, third.cursor, 5)
+      assert fourth.entries == []
+      assert fourth.eof?
+      assert {:ok, %{entries: [], eof?: true}} = WAL.read_from(name, fourth.cursor, 5)
+    end
+
+    test "stops before the first entry beyond a sequence cutoff", %{wal_dir: dir} do
+      {_pid, name} = start_wal(dir)
+
+      for i <- 1..3 do
+        :ok = WAL.append(name, %Entry{type: :write, payload: %{seq: i}})
+      end
+
+      assert {:ok, page} = WAL.read_from(name, :start, 10, 2)
+      assert Enum.map(page.entries, & &1.payload.seq) == [1, 2]
+      refute page.eof?
+
+      assert {:ok, remainder} = WAL.read_from(name, page.cursor, 10)
+      assert Enum.map(remainder.entries, & &1.payload.seq) == [3]
+    end
+
+    test "returns corruption without producing a page", %{wal_dir: dir} do
+      {pid, name} = start_wal(dir)
+      :ok = WAL.append(name, %Entry{type: :write, payload: "first"})
+      :ok = WAL.append(name, %Entry{type: :write, payload: "second"})
+      GenServer.stop(pid)
+
+      path = Path.join(dir, "wal.000001")
+      {:ok, <<_header::binary-10, length::unsigned-big-32, _rest::binary>>} = File.read(path)
+      second_crc_offset = 10 + 8 + length + 4
+      {:ok, fd} = :file.open(String.to_charlist(path), [:raw, :binary, :read, :write])
+      :ok = :file.pwrite(fd, second_crc_offset, <<0>>)
+      :file.close(fd)
+
+      {_pid, restarted_name} = start_wal(dir)
+
+      assert {:error, {:corrupt_entry, ^path, _offset, _reason}} =
+               WAL.read_from(restarted_name, :start, 10)
+    end
+  end
 end
