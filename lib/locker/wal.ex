@@ -389,7 +389,7 @@ defmodule Locker.WAL do
 
   @impl GenServer
   def handle_call(:writer_status, _from, state) do
-    {:reply, state.writes_halted, state}
+    {:reply, if(state.writes_halted, do: :writes_halted, else: :ok), state}
   end
 
   def handle_call({:append, _entry}, _from, %{writes_halted: true} = state) do

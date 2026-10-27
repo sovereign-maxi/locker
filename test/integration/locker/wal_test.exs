@@ -170,6 +170,16 @@ defmodule Locker.WALTest do
     end
   end
 
+  describe "writer_status/1" do
+    test "reports ok for a healthy writer and writes_halted for a latched writer", %{wal_dir: dir} do
+      {_pid, name} = start_wal(dir)
+      assert WAL.writer_status(name) == :ok
+
+      assert %{writes_halted: true} = :sys.replace_state(name, &Map.put(&1, :writes_halted, true))
+      assert WAL.writer_status(name) == :writes_halted
+    end
+  end
+
   describe "segment rotation" do
     test "rotates when segment exceeds max size", %{wal_dir: dir} do
       {_pid, name} = start_wal(dir, max_segment_bytes: 100)
