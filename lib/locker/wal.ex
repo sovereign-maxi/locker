@@ -39,7 +39,7 @@ defmodule Locker.WAL do
       flush_max_entries: 100
 
   A flush failure (write or fsync error) in `:buffered` mode is
-  fail-hard: the WAL GenServer stops with `{:flush_failed, reason}`
+  fail-hard: the WAL GenServer stops with `{:ambiguous_write, reason}`
   so the supervisor sees it. Entries already acknowledged as `:ok`
   but not yet flushed are unrecoverable — this is inherent to the
   write-behind tradeoff and callers who require per-entry
@@ -87,7 +87,6 @@ defmodule Locker.WAL do
   @default_max_segment_bytes 64 * 1024 * 1024
   @default_flush_interval_ms 500
   @default_flush_max_entries 100
-  @max_rotation_retries 3
   @max_queue_depth 500
   @max_read_bytes 128 * 1024 * 1024
 
@@ -143,11 +142,10 @@ defmodule Locker.WAL do
 
   Returns `:ok` or `{:error, reason}`. An encoding failure on any
   entry (unknown type, oversized payload) aborts the whole batch
-  before anything is written. A write/fsync failure returns
-  `{:error, {:wal_write_failed, reason}}`; because the batch is a
-  single write, a failure there can at worst leave a torn byte
-  tail (flagged as corruption by `read_all_strict/1`), never a
-  valid partial entry.
+  before anything is written. Once writing begins, a write/fsync
+  failure returns `{:error, {:ambiguous_write, reason}}` and latches
+  the writer shut: a complete entry or a torn byte tail may exist and
+  must be reconciled before writes resume.
 
   `timeout` bounds the GenServer call (default 5s).
   """
@@ -433,11 +431,11 @@ defmodule Locker.WAL do
     reply_after_buffered_batch_write(entries, state)
   end
 
-  def handle_call(:flush, _from, %{mode: :sync} = state), do: {:reply, :ok, state}
-
   def handle_call(:flush, _from, %{writes_halted: true} = state) do
     {:reply, {:error, :writes_halted}, state}
   end
+
+  def handle_call(:flush, _from, %{mode: :sync} = state), do: {:reply, :ok, state}
 
   def handle_call(:flush, _from, %{mode: :buffered} = state) do
     case do_flush(state) do
@@ -500,12 +498,16 @@ defmodule Locker.WAL do
     end
   end
 
+  def handle_call(:rotate, _from, %{writes_halted: true} = state) do
+    {:reply, {:error, :writes_halted}, state}
+  end
+
   def handle_call(:rotate, _from, state) do
     case maybe_drain_buffer(state) do
       {:ok, drained_state} ->
         case do_rotate(drained_state) do
           {:ok, new_state} -> {:reply, :ok, new_state}
-          {:error, reason} -> {:reply, {:error, reason}, drained_state}
+          {:error, reason} -> {:reply, {:error, reason}, %{drained_state | writes_halted: true}}
         end
 
       {:stop, reason, halted_state} ->
@@ -638,22 +640,10 @@ defmodule Locker.WAL do
           entry_count: state.entry_count + 1
       }
 
-      # Per-append header count update dropped: it was a second
-      # fsync per append (seek + write + sync + seek), doubling
-      # latency. The header count is authoritative only in the
-      # "no rotation, clean shutdown" case; the read path
-      # (`read_segment_entries` + `Entry.decode_all`) already
-      # tolerates a stale header count by scanning to EOF, so a
-      # per-append header write buys nothing that the entry stream
-      # itself doesn't already deliver. Header count is refreshed
-      # on segment rotation (below) and on graceful shutdown
-      # (`terminate/2`).
       new_state = maybe_rotate(new_state)
       {:reply, :ok, new_state}
     else
-      {:error, reason} ->
-        Logger.error("WAL: write/fsync failed: #{inspect(reason)}")
-        {:reply, {:error, {:wal_write_failed, reason}}, state}
+      {:error, reason} -> ambiguous_write(state, "write/fsync failed", reason)
     end
   end
 
@@ -682,9 +672,8 @@ defmodule Locker.WAL do
 
   # Atomic batch path for :sync mode: encode ALL entries first
   # (an encode failure aborts before anything is written), then a
-  # single write + fsync for the whole batch. The batch either
-  # lands in full or not at all — no durable prefix can strand
-  # behind a mid-batch per-entry failure.
+  # single write + fsync for the whole batch. A post-write failure
+  # is ambiguous because the complete batch may already be readable.
   defp reply_after_sync_batch_write(entries, state) do
     with {:ok, bins} <- encode_all(entries, state.type_map),
          :ok <- :file.write(state.fd, bins),
@@ -702,8 +691,7 @@ defmodule Locker.WAL do
         {:reply, err, state}
 
       {:error, reason} ->
-        Logger.error("WAL: batch write/fsync failed: #{inspect(reason)}")
-        {:reply, {:error, {:wal_write_failed, reason}}, state}
+        ambiguous_write(state, "batch write/fsync failed", reason)
     end
   end
 
@@ -755,7 +743,6 @@ defmodule Locker.WAL do
   defp do_flush(%{buffer: []} = state), do: {:ok, state}
 
   defp do_flush(state) do
-    # Reverse to write-order (buffer is prepended for cheap enqueue).
     entries = Enum.reverse(state.buffer)
     flushed_count = state.buffer_count
     flushed_bytes = state.buffer_bytes
@@ -775,11 +762,11 @@ defmodule Locker.WAL do
     else
       {:error, reason} ->
         Logger.error(
-          "WAL: buffered flush of #{flushed_count} entries failed: #{inspect(reason)} — halting"
+          "WAL: buffered flush ambiguous, entries=#{flushed_count}, reason=#{inspect(reason)}"
         )
 
         halted_state = %{state | writes_halted: true}
-        {:stop, {:flush_failed, reason}, halted_state}
+        {:stop, {:ambiguous_write, reason}, halted_state}
     end
   end
 
@@ -801,45 +788,38 @@ defmodule Locker.WAL do
 
     bin = Entry.encode(checkpoint_entry, state.type_map)
 
-    case :file.write(state.fd, bin) do
-      :ok ->
-        :file.sync(state.fd)
+    with :ok <- :file.write(state.fd, bin),
+         :ok <- :file.sync(state.fd) do
+      new_state = %{
+        state
+        | bytes_written: state.bytes_written + byte_size(bin),
+          entry_count: state.entry_count + 1
+      }
 
-        new_state = %{
-          state
-          | bytes_written: state.bytes_written + byte_size(bin),
-            entry_count: state.entry_count + 1
-        }
-
-        update_header_count_with_retry(new_state)
-        {:reply, :ok, new_state}
-
-      {:error, reason} ->
-        {:reply, {:error, {:checkpoint_failed, reason}}, state}
+      update_header_count_with_retry(new_state)
+      {:reply, :ok, new_state}
+    else
+      {:error, reason} -> ambiguous_write(state, "checkpoint write/fsync failed", reason)
     end
+  end
+
+  defp ambiguous_write(state, context, reason) do
+    Logger.error("WAL: #{context}, reason=#{inspect(reason)}, outcome=ambiguous")
+    {:reply, {:error, {:ambiguous_write, reason}}, %{state | writes_halted: true}}
   end
 
   defp maybe_rotate(%{bytes_written: bytes, max_segment_bytes: max} = state)
        when bytes >= max do
-    rotation_failures = Map.get(state, :rotation_failures, 0)
-
     case do_rotate(state) do
       {:ok, rotated_state} ->
-        Map.delete(rotated_state, :rotation_failures)
+        rotated_state
 
       {:error, reason} ->
-        failures = rotation_failures + 1
-
-        Logger.warning(
-          "WAL: segment rotation failed (attempt #{failures}/#{@max_rotation_retries}): #{inspect(reason)}"
+        Logger.error(
+          "WAL: segment rotation failed, reason=#{inspect(reason)}, outcome=writes_halted"
         )
 
-        if failures >= @max_rotation_retries do
-          Logger.error("WAL: #{failures} consecutive rotation failures, halting writes")
-          Map.merge(state, %{rotation_failures: failures, writes_halted: true})
-        else
-          Map.put(state, :rotation_failures, failures)
-        end
+        %{state | writes_halted: true}
     end
   end
 
@@ -857,23 +837,26 @@ defmodule Locker.WAL do
 
     case open_or_create_segment(new_path) do
       {:ok, fd, bytes} ->
-        try do
-          :file.sync(state.fd)
-        after
-          :file.close(state.fd)
+        case :file.sync(state.fd) do
+          :ok ->
+            :ok = safe_close_fd(state.fd)
+
+            new_state = %{
+              state
+              | fd: fd,
+                segment_index: new_index,
+                segment_path: new_path,
+                entry_count: 0,
+                bytes_written: bytes
+            }
+
+            update_header_count_with_retry(new_state)
+            {:ok, new_state}
+
+          {:error, reason} ->
+            safe_close_fd(fd)
+            {:error, {:rotate_failed, reason}}
         end
-
-        new_state = %{
-          state
-          | fd: fd,
-            segment_index: new_index,
-            segment_path: new_path,
-            entry_count: 0,
-            bytes_written: bytes
-        }
-
-        update_header_count_with_retry(new_state)
-        {:ok, new_state}
 
       {:error, reason} ->
         {:error, {:rotate_failed, reason}}
@@ -955,24 +938,43 @@ defmodule Locker.WAL do
   defp create_new_segment(path) do
     header = <<@magic, @version::unsigned-big-16, 0::unsigned-big-32>>
 
-    # Header-corrupt segments reach here only after
-    # quarantine_corrupt_segment/1 has renamed them aside, so the
-    # truncate below is a fallback for a failed rename (and a no-op
-    # for genuinely new files). (:truncate in the open modes is
-    # silently ignored when :read is present, hence the explicit
-    # :file.truncate/1.)
     case :file.open(String.to_charlist(path), [:raw, :binary, :read, :write]) do
       {:ok, fd} ->
-        :ok = :file.truncate(fd)
+        result =
+          with :ok <- :file.truncate(fd),
+               :ok <- File.chmod(path, 0o600),
+               :ok <- :file.write(fd, header),
+               :ok <- :file.sync(fd),
+               :ok <- fsync_dir(Path.dirname(path)) do
+            {:ok, fd, @header_size}
+          end
 
-        # Restrict permissions to owner only (0600)
-        File.chmod(path, 0o600)
-        :ok = :file.write(fd, header)
-        :file.sync(fd)
-        {:ok, fd, @header_size}
+        case result do
+          {:ok, _fd, _bytes} -> result
+          {:error, _reason} -> safe_close_fd(fd)
+        end
+
+        result
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp fsync_dir(dir) do
+    case :file.open(String.to_charlist(dir), [:read, :raw, :directory]) do
+      {:ok, fd} ->
+        result = :file.sync(fd)
+        close_result = :file.close(fd)
+
+        case {result, close_result} do
+          {:ok, :ok} -> :ok
+          {{:error, reason}, _close_result} -> {:error, {:directory_sync_failed, reason}}
+          {:ok, {:error, reason}} -> {:error, {:directory_close_failed, reason}}
+        end
+
+      {:error, reason} ->
+        {:error, {:directory_open_failed, reason}}
     end
   end
 

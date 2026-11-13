@@ -180,6 +180,38 @@ defmodule Locker.WALTest do
     end
   end
 
+  describe "ambiguous write failures" do
+    test "an fsync failure after a successful write latches the writer", %{wal_dir: dir} do
+      {_pid, name} = start_wal(dir)
+
+      :sys.replace_state(name, fn state ->
+        {:ok, null_fd} = :file.open(~c"/dev/null", [:raw, :binary, :read, :write])
+        Map.put(state, :fd, null_fd)
+      end)
+
+      assert {:error, {:ambiguous_write, _reason}} =
+               WAL.append(name, %Entry{type: :write, payload: %{key: "perhaps-written"}})
+
+      assert WAL.writer_status(name) == :writes_halted
+
+      assert {:error, :writes_halted} =
+               WAL.append(name, %Entry{type: :write, payload: %{key: "rejected"}})
+    end
+
+    test "batch fsync failure is distinct from a pre-write encoding refusal", %{wal_dir: dir} do
+      {_pid, name} = start_wal(dir)
+      entry = %Entry{type: :write, payload: %{key: "perhaps-written"}}
+
+      :sys.replace_state(name, fn state ->
+        {:ok, null_fd} = :file.open(~c"/dev/null", [:raw, :binary, :read, :write])
+        Map.put(state, :fd, null_fd)
+      end)
+
+      assert {:error, {:ambiguous_write, _reason}} = WAL.append_batch(name, [entry])
+      assert WAL.writer_status(name) == :writes_halted
+    end
+  end
+
   describe "segment rotation" do
     test "rotates when segment exceeds max size", %{wal_dir: dir} do
       {_pid, name} = start_wal(dir, max_segment_bytes: 100)
