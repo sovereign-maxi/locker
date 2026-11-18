@@ -119,10 +119,14 @@ defmodule Locker.WAL do
   Appends an entry and guarantees it (plus every prior buffered
   entry) is on disk and fsynced before returning. Behaves identically
   to `append/2` in `:sync` mode; in `:buffered` mode drains the
-  buffer first. Accepts the same optional call timeout as `append/3`.
+  buffer first.
+
+  The call waits `:infinity` by default: a slow disk must not produce
+  a caller timeout while the durability write remains in flight.
+  Callers with their own commit budget may pass an explicit timeout.
   """
   @spec append_sync(GenServer.server(), Entry.t(), timeout()) :: :ok | {:error, term()}
-  def append_sync(server \\ __MODULE__, %Entry{} = entry, timeout \\ 5_000) do
+  def append_sync(server \\ __MODULE__, %Entry{} = entry, timeout \\ :infinity) do
     with :ok <- check_overloaded(server) do
       GenServer.call(server, {:append_sync, entry}, timeout)
     end
