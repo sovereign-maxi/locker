@@ -151,10 +151,12 @@ defmodule Locker.WAL do
   the writer shut: a complete entry or a torn byte tail may exist and
   must be reconciled before writes resume.
 
-  `timeout` bounds the GenServer call (default 5s).
+  The call waits `:infinity` by default: a slow disk must not produce
+  a caller timeout while the durability write remains in flight.
+  Callers with their own commit budget may pass an explicit timeout.
   """
   @spec append_batch(GenServer.server(), [Entry.t()], timeout()) :: :ok | {:error, term()}
-  def append_batch(server \\ __MODULE__, entries, timeout \\ 5_000) when is_list(entries) do
+  def append_batch(server \\ __MODULE__, entries, timeout \\ :infinity) when is_list(entries) do
     with :ok <- check_overloaded(server) do
       GenServer.call(server, {:append_batch, entries}, timeout)
     end

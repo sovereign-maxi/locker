@@ -509,6 +509,31 @@ defmodule Locker.WALTest do
       assert {:ok, [%Entry{payload: "delayed"}]} = WAL.read_all(name)
     end
 
+    @tag timeout: 15_000
+    test "append_batch waits past the old five-second default for a delayed disk call", %{
+      wal_dir: dir
+    } do
+      {_pid, name} = start_wal(dir, mode: :sync)
+      :ok = :sys.suspend(name)
+
+      append =
+        Task.async(fn ->
+          WAL.append_batch(name, [
+            %Entry{type: :write, payload: "delayed-1"},
+            %Entry{type: :write, payload: "delayed-2"}
+          ])
+        end)
+
+      Process.sleep(5_100)
+      before_resume = Task.yield(append, 0) || :blocked
+      :ok = :sys.resume(name)
+
+      assert before_resume == :blocked
+      assert :ok = Task.await(append)
+      assert {:ok, entries} = WAL.read_all(name)
+      assert Enum.map(entries, & &1.payload) == ["delayed-1", "delayed-2"]
+    end
+
     test "periodic flush drains buffer on its own schedule", %{wal_dir: dir} do
       {_pid, name} =
         start_wal(dir, mode: :buffered, flush_max_entries: 1_000, flush_interval_ms: 50)
